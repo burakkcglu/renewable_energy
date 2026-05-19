@@ -1,0 +1,6 @@
+data/processed/*.csv
+data/raw/*.csv
+results/*.csv
+__pycache__/
+*.ipynb_checkpoints/
+.DS_Store

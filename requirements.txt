@@ -1,0 +1,12 @@
+numpy
+pandas
+scipy
+pymoo
+tqdm
+plotly
+folium
+ipywidgets
+openpyxl
+xlrd
+notebook
+nbformat>=4.2.0
