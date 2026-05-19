@@ -20,7 +20,7 @@ BUDGET = 50000.0  # Milyon USD
 MIN_REGIONAL_MW = 500.0
 
 # --- SLSQP'de başarıyı getiren Ölçek Normalizasyonu ---
-VAR_SCALE = 1e7     # Risk ölçeği
+VAR_SCALE = 1.2e7   # Risk ölçeği
 COST_SCALE = BUDGET # Maliyet ölçeği
 
 def normalize_name(text):
@@ -94,6 +94,7 @@ def run_nsga2():
     
     # 2. Talep ve Sınırlar
     df_features = pd.read_csv(os.path.join(PROCESSED_DIR, "province_features.csv"))
+    df_features = df_features.drop_duplicates(subset=['province'], keep='last')
     df_features['norm_prov'] = df_features['province'].apply(normalize_name)
     df_features = df_features.set_index('norm_prov')
     

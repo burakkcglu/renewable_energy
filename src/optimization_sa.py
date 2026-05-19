@@ -14,7 +14,7 @@ BUDGET = 50000.0  # Milyon USD
 MIN_REGIONAL_MW = 500.0
 
 # Ölçek Normalizasyonu (SLSQP ve NSGA-II ile aynı)
-VAR_SCALE = 1e7
+VAR_SCALE = 1.2e7
 COST_SCALE = BUDGET
 
 def normalize_name(text):
@@ -135,12 +135,23 @@ def run_simulated_annealing():
         T *= alpha
 
     # 6. Post-Processing: Eğer üretim hedefin altında kaldıysa orantılı olarak scale-up yap
+    # 6. Post-Processing: Eğer üretim hedefin altında kaldıysa orantılı olarak scale-up yap
     if best_prod < TARGET_DEMAND:
         print("\nUyarı: Hedef üretim sağlanamadı, post-processing (scale-up) uygulanıyor...")
-        scale_factor = TARGET_DEMAND / best_prod
-        best_x = np.clip(best_x * scale_factor, 0, x_max)
-        # Yeniden hesapla
-        best_obj, best_cost, best_risk, best_prod = evaluate_fitness(best_x, cov_matrix, mu_vector, cost_vector, TARGET_DEMAND, regional_indices)
+        # İteratif scale-up: clip → recompute → repeat (max 10 deneme)
+        for attempt in range(10):
+            if best_prod >= TARGET_DEMAND:
+                break
+            scale_factor = TARGET_DEMAND / max(best_prod, 1e-6)
+            best_x = np.clip(best_x * scale_factor, 0, x_max)
+            best_obj, best_cost, best_risk, best_prod = evaluate_fitness(
+                best_x, cov_matrix, mu_vector, cost_vector,
+                TARGET_DEMAND, regional_indices
+            )
+        if best_prod < TARGET_DEMAND:
+            print(f"  ⚠ Post-processing yetersiz: prod={best_prod:.2f}, target={TARGET_DEMAND:.2f}")
+            print(f"     Modeliniz kapasite sınırları altında hedef üretime ulaşamıyor. "
+                f"Upper bound'ları gevşetmeyi düşünün.")
 
     # 7. Sonuçları Kaydet
     results = [[best_cost, best_risk, best_prod] + list(best_x)]

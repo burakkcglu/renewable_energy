@@ -208,12 +208,16 @@ def process_all_data():
     cov_matrix, mu_vector, asset_names, monthly_cf_matrix = compute_covariance_matrix(
         df, frequency='monthly'
     )
-
     # Save monthly CF matrix for Monte Carlo robustness analysis
-    monthly_cf_matrix.to_csv(
-        os.path.join(PROCESSED_DIR, "monthly_cf_matrix.csv")
-    )
-    print(f"Monthly CF matrix saved: {monthly_cf_matrix.shape}")
+    monthly_cf_path = os.path.join(PROCESSED_DIR, "monthly_cf_matrix.csv")
+    monthly_cf_matrix.to_csv(monthly_cf_path)
+    print(f"Monthly CF matrix saved: {monthly_cf_matrix.shape} -> {monthly_cf_path}")
+
+    # Daily CF matrix (for Monte Carlo with finer weather noise)
+    daily_cf_path = os.path.join(PROCESSED_DIR, "daily_cf_matrix.csv")
+    # Re-build daily wide format quickly (avoid recomputation)
+    daily_wide_path = daily_cf_path  # placeholder
+    # Sadece monthly tutuyoruz, daily zaten daily_with_cf.csv'de var (long format)
 
     # Save covariance matrix
     cov_df = pd.DataFrame(cov_matrix,
@@ -334,7 +338,7 @@ def compute_covariance_matrix(df, frequency='monthly'):
     # Monthly aggregation: take mean CF for each (year, month, asset)
     if frequency == 'monthly':
         wide.index = pd.to_datetime(wide.index)
-        wide_agg = wide.resample('M').mean().dropna()
+        wide_agg = wide.resample('ME').mean().dropna()
     else:
         wide_agg = wide
 
