@@ -1,9 +1,9 @@
 """
 data_collection.py
-Fetches solar radiation, wind speed and temperature data
-from NASA POWER API for all 81 Turkish provinces.
+Gets solar, wind, and temperature data from the NASA POWER API
+for all 81 provinces of Turkey.
 
-Usage:
+How to run:
     python src/data_collection.py
 """
 
@@ -15,15 +15,15 @@ import pandas as pd
 from tqdm import tqdm
 
 
-# --- Config ---
+# --- Settings ---
 BASE_URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
 PARAMETERS = "ALLSKY_SFC_SW_DWN,WS10M,WS50M,T2M"
-COMMUNITY = "RE"  # Renewable Energy community
+COMMUNITY = "RE"  # Renewable Energy group
 START_DATE = "20040101"
 END_DATE = "20241231"
 FORMAT = "JSON"
 
-# Paths
+# File paths
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DIR = os.path.join(PROJECT_DIR, "data", "raw")
 PROCESSED_DIR = os.path.join(PROJECT_DIR, "data", "processed")
@@ -31,7 +31,7 @@ PROVINCES_FILE = os.path.join(PROJECT_DIR, "data", "tr_provinces_coords.csv")
 
 
 def load_provinces(filepath):
-    """Load the 81 province coordinates from CSV and sanity-check naming."""
+    """Read the 81 province locations from a CSV file and check for problems."""
     df = pd.read_csv(filepath)
     print(f"Loaded {len(df)} provinces from {filepath}")
 
@@ -42,26 +42,26 @@ def load_provinces(filepath):
             f"Need: {required_cols}, found: {set(df.columns)}"
         )
     if len(df) != 81:
-        print(f"  ⚠ Warning: Expected 81 provinces, found {len(df)}")
+        print(f"  [WARNING] Expected 81 provinces, found {len(df)}")
     if df['province'].duplicated().any():
         dupes = df[df['province'].duplicated()]['province'].tolist()
-        print(f"  ⚠ Warning: Duplicate provinces: {dupes}")
+        print(f"  [WARNING] Duplicate provinces: {dupes}")
 
     return df
 
 
 def fetch_province_data(province_name, lat, lon, retries=3, delay=10):
     """
-    Fetch daily solar, wind and temperature data for one province.
-    
+    Get daily solar, wind, and temperature data for one province.
+
     Parameters
     ----------
     province_name : str
     lat : float
     lon : float
-    retries : int - number of retry attempts on failure
-    delay : int - seconds to wait between retries
-    
+    retries : int - how many times to try again if it fails
+    delay : int - seconds to wait between tries
+
     Returns
     -------
     dict or None
@@ -84,7 +84,7 @@ def fetch_province_data(province_name, lat, lon, retries=3, delay=10):
                 data = resp.json()
                 return data
             elif resp.status_code == 429:
-                # Rate limited, wait longer
+                # Too many requests, wait longer
                 wait = delay * (attempt + 2)
                 print(f"  Rate limited for {province_name}, "
                       f"waiting {wait}s...")
@@ -104,38 +104,38 @@ def fetch_province_data(province_name, lat, lon, retries=3, delay=10):
 
 def parse_api_response(data, province_name):
     """
-    Parse NASA POWER JSON response into a clean DataFrame.
-    
-    Returns DataFrame with columns:
+    Turn the NASA POWER JSON response into a clean DataFrame.
+
+    Returns a DataFrame with these columns:
         date, solar_radiation, wind_speed_10m, wind_speed_50m, temperature
     """
     try:
         params = data["properties"]["parameter"]
 
         solar = params["ALLSKY_SFC_SW_DWN"]  # kWh/m2/day
-        wind = params["WS10M"]               # m/s (10 metre)
-        wind_50 = params["WS50M"]            # m/s (50 metre)
+        wind = params["WS10M"]               # m/s at 10 meters
+        wind_50 = params["WS50M"]            # m/s at 50 meters
         temp = params["T2M"]                 # Celsius
 
-        # Build DataFrame from the parameter dicts
+        # Create a DataFrame from the data
         records = []
         for date_str in solar.keys():
             s_val = solar[date_str]
             w_val = wind.get(date_str, None)
-            w50_val = wind_50.get(date_str, None) # 50m hızını o gün için al
+            w50_val = wind_50.get(date_str, None) # get 50m wind speed for this day
             t_val = temp.get(date_str, None)
 
-            # NASA uses -999.0 for missing values
+            # NASA writes -999.0 when there is no data
             if s_val == -999.0: s_val = None
             if w_val == -999.0: w_val = None
-            if w50_val == -999.0: w50_val = None  # 50m için eksik veri kontrolü
+            if w50_val == -999.0: w50_val = None  # check for missing 50m data
             if t_val == -999.0: t_val = None
 
             records.append({
                 "date": date_str,
                 "solar_radiation": s_val,
-                "wind_speed": w_val,         # 10m hızı
-                "wind_speed_50": w50_val,    # 50m hızı eklendi!
+                "wind_speed": w_val,         # 10m speed
+                "wind_speed_50": w50_val,    # 50m speed added
                 "temperature": t_val
             })
 
@@ -151,21 +151,21 @@ def parse_api_response(data, province_name):
 
 def fetch_all_provinces(provinces_df, output_dir):
     """
-    Fetch data for all 81 provinces and save individual CSVs.
-    Also saves a combined CSV.
+    Get data for all 81 provinces and save each one as a CSV file.
+    Also saves one big combined CSV file.
     """
     os.makedirs(output_dir, exist_ok=True)
 
     all_frames = []
     failed = []
 
-    # Sanity: warn if province names look ASCII-only (could indicate
-    # a non-canonical CSV that will break downstream merges)
+    # Check if province names are only in ASCII (this can cause
+    # problems when joining tables later)
     if 'province' in provinces_df.columns:
         sample = provinces_df['province'].astype(str).str.cat(sep=' ')
         if not any(c in sample for c in 'çğıöşüÇĞİÖŞÜ'):
-            print("  ⚠ Warning: Province names appear ASCII-only. "
-                  "Downstream merges expect Turkish characters (e.g. 'İstanbul').")
+            print("  [WARNING] Province names are ASCII-only. "
+                  "Later steps need Turkish characters (e.g. 'Istanbul').")
 
     for idx, row in tqdm(provinces_df.iterrows(),
                          total=len(provinces_df),
@@ -175,7 +175,7 @@ def fetch_all_provinces(provinces_df, output_dir):
         lat = row["lat"]
         lon = row["lon"]
 
-        # Check if already downloaded
+        # Skip if we already have this file
         outfile = os.path.join(output_dir, f"{name}.csv")
         if os.path.exists(outfile):
             print(f"  {name} already exists, skipping...")
@@ -183,28 +183,28 @@ def fetch_all_provinces(provinces_df, output_dir):
             all_frames.append(df)
             continue
 
-        # Fetch from API
+        # Get data from the API
         raw_data = fetch_province_data(name, lat, lon)
 
         if raw_data is None:
             failed.append(name)
             continue
 
-        # Parse response
+        # Read the response data
         df = parse_api_response(raw_data, name)
 
         if df is None:
             failed.append(name)
             continue
 
-        # Save individual province CSV
+        # Save this province to its own CSV file
         df.to_csv(outfile, index=False)
         all_frames.append(df)
 
-        # Be nice to the API - wait between requests
+        # Wait a bit so we don't send too many requests
         time.sleep(2)
 
-    # Combine all provinces into one big CSV
+    # Put all provinces together into one CSV file
     if all_frames:
         combined = pd.concat(all_frames, ignore_index=True)
         combined_path = os.path.join(
@@ -220,13 +220,13 @@ def fetch_all_provinces(provinces_df, output_dir):
     if failed:
         print(f"\nFailed provinces ({len(failed)}): {failed}")
     else:
-        print("\nAll 81 provinces fetched successfully!")
+        print("\nAll 81 provinces downloaded successfully.")
 
     return all_frames, failed
 
 
 def print_data_summary(data_dir):
-    """Print a summary of downloaded data."""
+    """Show a short summary of the data we downloaded."""
     combined_path = os.path.join(PROCESSED_DIR, "all_provinces_daily.csv")
 
     if not os.path.exists(combined_path):
@@ -249,8 +249,8 @@ def print_data_summary(data_dir):
     print(df["solar_radiation"].describe().round(2))
     print(f"\nWind speed (m/s):")
     print(df["wind_speed"].describe().round(2))
-    print(f"\nWind speed 50m (m/s):") # Eklendi
-    print(df["wind_speed_50"].describe().round(2)) # Eklendi
+    print(f"\nWind speed 50m (m/s):") # added
+    print(df["wind_speed_50"].describe().round(2)) # added
     print(f"\nTemperature (C):")
     print(df["temperature"].describe().round(2))
 
@@ -261,11 +261,11 @@ if __name__ == "__main__":
     print("Turkey 81 Provinces - Solar & Wind")
     print("="*50)
 
-    # Load province coordinates
+    # Read province locations
     provinces = load_provinces(PROVINCES_FILE)
 
-    # Fetch all data
+    # Download all data
     frames, failed = fetch_all_provinces(provinces, RAW_DIR)
 
-    # Print summary
+    # Show summary
     print_data_summary(RAW_DIR)

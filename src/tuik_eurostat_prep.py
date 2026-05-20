@@ -1,7 +1,7 @@
 """
 tuik_energy_pipeline.py
-Pipeline step: Cleans messy TUIK population Excel tables (.xlsx/.xls), 
-extracts province features, and prepares dynamic demand scaling values.
+Cleans TUIK population Excel files, gets province features,
+and prepares demand values for the optimization.
 """
 
 import os
@@ -12,7 +12,7 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
 PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
 
-# YENİ EKLE
+# Sector name mapping from raw TUIK labels to short names
 SECTOR_MAP = {
     '1. (Mesken)': 'Mesken',
     '2. (Ticaret Ve Kamu Hizmetleri)': 'Ticaret_Kamu',
@@ -22,16 +22,16 @@ SECTOR_MAP = {
 }
 
 # =====================================================================
-# 1. TÜİK ELECTRICITY CONSUMPTION (REQUIRED)
+# 1. TUIK ELECTRICITY USAGE (REQUIRED)
 # =====================================================================
 
 def parse_tuik_electricity(filepath):
-    """Parse messy pipe-separated TÜİK electricity consumption CSV."""
+    """Read and clean the pipe-separated TUIK electricity usage CSV file."""
     print(f"  Reading: {os.path.basename(filepath)}")
-    # Read raw without auto-detecting headers
+    # Read the raw file without guessing headers
     df_raw_all = pd.read_csv(filepath, sep='|', encoding='utf-8-sig', header=None, dtype=str)
 
-    # Find which row contains the province names (look for 'Satırlar' marker or 'Adana')
+    # Find the row that has province names by looking for 'Adana'
     header_row = None
     for i in range(min(10, len(df_raw_all))):
         row_str = ' '.join([str(v) for v in df_raw_all.iloc[i].values if pd.notna(v)])
@@ -42,7 +42,7 @@ def parse_tuik_electricity(filepath):
     if header_row is None:
         raise ValueError(f"Could not locate province header row in {filepath}")
 
-    # Use that row as the column names, drop everything above it
+    # Set that row as column names and remove rows above it
     df_raw = df_raw_all.iloc[header_row + 1:].copy()
     df_raw.columns = df_raw_all.iloc[header_row].values
     df_raw = df_raw.reset_index(drop=True)
@@ -53,10 +53,10 @@ def parse_tuik_electricity(filepath):
     province_names = []
     for col in province_cols_raw:
         col = str(col).strip()
-        # Skip empty, unnamed, NaN, and entries without a plate-number suffix
+        # Skip empty or unnamed columns
         if not col or col.lower() in ('unnamed', 'nan', 'none') or col.lower().startswith('unnamed'):
             continue
-        # Real province entries have format 'Adana-1' — must contain a hyphen with digits
+        # Real province names look like 'Adana-1' with a number after the dash
         if '-' not in col:
             continue
         name_part, plate_part = col.rsplit('-', 1)
@@ -65,7 +65,7 @@ def parse_tuik_electricity(filepath):
         province_names.append(name_part.strip())
 
     if len(province_names) != 81:
-        print(f"  ⚠ Warning: Found {len(province_names)} provinces (expected 81)")
+        print(f"  [WARNING] Found {len(province_names)} provinces (expected 81)")
 
     new_cols = ['Metrik', 'Sektor', 'Yil'] + province_names
     while len(new_cols) < len(raw_cols):
@@ -91,14 +91,14 @@ def parse_tuik_electricity(filepath):
     df_long = df_long.dropna(subset=['Tuketim_MWh'])
     df_long['Sektor'] = df_long['Sektor'].map(SECTOR_MAP).fillna(df_long['Sektor'])
 
-    print(f"  ✓ Parsed {len(province_names)} provinces, "
+    print(f"  [OK] Parsed {len(province_names)} provinces, "
           f"{df_long['Yil'].nunique()} years, "
           f"{df_long['Sektor'].nunique()} sectors")
     return df_long
 
 
 def build_demand_tables(df_long):
-    """Total demand per province×year, and the sectoral breakdown."""
+    """Get total demand for each province and year, plus sector breakdown."""
     df_total = (df_long.groupby(['Yil', 'Il'])['Tuketim_MWh']
                 .sum()
                 .reset_index()
@@ -107,21 +107,17 @@ def build_demand_tables(df_long):
 
 
 # =====================================================================
-# 2. TÜİK POPULATION & DENSITY (REQUIRED for upper bounds)
+# 2. TUIK POPULATION AND DENSITY (REQUIRED for upper bounds)
 # =====================================================================
 
 def parse_tuik_population_xls(filepath):
     """
-    Parse the TÜİK 'İl ve Cinsiyete Göre İl/İlçe Merkezi, Belde/Köy Nüfusu
-    ve Nüfus Yoğunluğu' workbook (.xls format from veriportali.tuik.gov.tr).
+    Read population and density data from the TUIK Excel workbook.
 
-    Structure:
-      Rows 0-3 : metadata + multi-row header
-      Row 4    : 'Toplam-Total' (Turkey-wide aggregate — skipped)
-      Rows 5+  : per-province data, alphabetic order, with year forward-fill
-      Columns  : A=Year, B=Province, C=Total Pop, ..., N=Density (people/km²)
+    The file has metadata in the first rows, then province data below.
+    We skip the total row and get the latest year's numbers.
 
-    Returns latest year's snapshot: province, population, density.
+    Returns: province, population, density for the most recent year.
     """
     engine = 'xlrd' if filepath.lower().endswith('.xls') else 'openpyxl'
     df_raw = pd.read_excel(filepath, engine=engine, sheet_name=0, header=None)
@@ -145,7 +141,7 @@ def parse_tuik_population_xls(filepath):
 
     latest = int(df['year'].max())
     df_latest = df[df['year'] == latest][['province', 'population', 'density']]
-    print(f"  ✓ Population & density for {len(df_latest)} provinces (year {latest})")
+    print(f"  [OK] Population and density for {len(df_latest)} provinces (year {latest})")
     return df_latest.reset_index(drop=True)
 
 
@@ -154,11 +150,11 @@ def parse_tuik_population_xls(filepath):
 # =====================================================================
 
 def parse_eurostat(filepath):
-    """Parse Eurostat nrg_ind_ren CSV → Country, Yil, RenewableShare_Pct."""
+    """Read Eurostat renewable energy CSV and get Country, Year, Share columns."""
     df = pd.read_csv(filepath)
 
-    # Eurostat now ships dual-column CSVs (both 'geo' code and 'Geopolitical entity'
-    # name). We keep the human-readable name and the year/value.
+    # Eurostat CSV files have both a country code and a full name column.
+    # We keep the readable name and the year/value.
     keep_map = {}
     for c in df.columns:
         cl = c.strip().lower()
@@ -171,10 +167,10 @@ def parse_eurostat(filepath):
         elif cl == 'nrg_bal':
             keep_map[c] = 'Indicator'
 
-    # Prefer human-readable Country column if both exist
+    # If there are two country columns, keep the readable one
     cols_found = list(keep_map.values())
     if cols_found.count('Country') > 1:
-        # Drop the 'geo' code, keep 'Geopolitical entity (reporting)'
+        # Remove the short code, keep the full country name
         for c, target in list(keep_map.items()):
             if target == 'Country' and c.strip().lower() == 'geo':
                 del keep_map[c]
@@ -183,7 +179,7 @@ def parse_eurostat(filepath):
             if target == 'Yil' and c.strip().lower() == 'time':
                 del keep_map[c]
     if cols_found.count('RenewableShare_Pct') > 1:
-    # If somehow both got mapped, prefer the OBS_VALUE (numeric) over the description
+    # If both got mapped, keep the numeric value column
         for c, target in list(keep_map.items()):
             if target == 'RenewableShare_Pct' and c.strip().lower() != 'obs_value':
                 del keep_map[c]
@@ -197,8 +193,8 @@ def parse_eurostat(filepath):
     df['RenewableShare_Pct'] = pd.to_numeric(df['RenewableShare_Pct'], errors='coerce')
     df = df.dropna(subset=['Yil', 'RenewableShare_Pct'])
     df = df.sort_values(['Country', 'Yil']).reset_index(drop=True)
-    print(f"  ✓ Eurostat: {df['Country'].nunique()} countries, "
-          f"{df['Yil'].min()}–{df['Yil'].max()}")
+    print(f"  [OK] Eurostat: {df['Country'].nunique()} countries, "
+          f"{df['Yil'].min()}-{df['Yil'].max()}")
     return df
 
 # =====================================================================
@@ -206,7 +202,7 @@ def parse_eurostat(filepath):
 # =====================================================================
 
 def build_province_features(df_total, df_pop, reference_year=2024):
-    """One-row-per-province feature table with intensity_class from density."""
+    """Build one row per province with demand and density class."""
     available_years = df_total['Yil'].unique()
     if reference_year not in available_years:
         reference_year = int(max(available_years))
@@ -221,7 +217,7 @@ def build_province_features(df_total, df_pop, reference_year=2024):
     df_ref['reference_year'] = reference_year
     df_ref = df_ref.merge(df_pop, on='province', how='left')
 
-    # Intensity class from density (used by optimization upper bounds)
+    # Split provinces into density groups (used for capacity limits)
     signal = df_ref['density']
     q33 = signal.quantile(0.33)
     q67 = signal.quantile(0.67)
@@ -230,19 +226,19 @@ def build_province_features(df_total, df_pop, reference_year=2024):
         if pd.isna(v):
             return 'medium'
         if v > q67:
-            return 'high'    # crowded → tight cap
+            return 'high'    # crowded, lower capacity limit
         elif v > q33:
             return 'medium'
         else:
-            return 'low'     # spacious → loose cap
+            return 'low'     # more space, higher capacity limit
 
     df_ref['intensity_class'] = signal.apply(classify)
-    print(f"  ✓ Intensity classification from density")
+    print(f"  [OK] Intensity classification from density")
     return df_ref
 
 
 def add_geographic_regions(df_features):
-    """Add 'region' column (7 geographic regions of Turkey)."""
+    """Add a 'region' column for the 7 regions of Turkey."""
     region_map = {
         'Marmara': ['İstanbul', 'Tekirdağ', 'Edirne', 'Kırklareli', 'Bursa',
                     'Balıkesir', 'Çanakkale', 'Yalova', 'Kocaeli', 'Sakarya',
@@ -267,49 +263,49 @@ def add_geographic_regions(df_features):
     df_features['region'] = df_features['province'].map(il_to_region)
     unmapped = df_features[df_features['region'].isna()]['province'].tolist()
     if unmapped:
-        print(f"  ⚠ Unmapped provinces: {unmapped}")
+        print(f"  [WARNING] Unmapped provinces: {unmapped}")
     return df_features
 
 def prepare_tuik_data(reference_year=2024):
-    """Called from main.py. Builds all processed feature tables."""
+    """Main function called from main.py. Builds all processed data tables."""
     print("=" * 60)
-    print("🚀 TÜİK + EUROSTAT DATA PIPELINE")
+    print("TUIK + EUROSTAT DATA PIPELINE")
     print("=" * 60)
     os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-    # [1/3] Electricity (REQUIRED)
-    print("\n[1/3] TÜİK electricity consumption…")
+    # [1/3] Electricity data (required)
+    print("\n[1/3] TUIK electricity usage...")
     elec_candidates = [
         os.path.join(DATA_DIR, "raw", "tuik_elektrik_tuketim.csv"),
     ]
     elec_path = next((p for p in elec_candidates if os.path.exists(p)), None)
     if elec_path is None:
-        print(f"❌ ERROR: TÜİK electricity CSV not found in data/raw/")
+        print(f"[ERROR] TUIK electricity CSV not found in data/raw/")
         return None
     df_long = parse_tuik_electricity(elec_path)
     df_total, df_sectoral = build_demand_tables(df_long)
     df_total.to_csv(os.path.join(PROCESSED_DIR, "demand_by_province.csv"), index=False)
     df_sectoral.to_csv(os.path.join(PROCESSED_DIR, "demand_by_province_sector.csv"), index=False)
 
-    # [2/3] Population & density (REQUIRED)
-    print("\n[2/3] TÜİK population & density…")
+    # [2/3] Population and density (required)
+    print("\n[2/3] TUIK population and density...")
     pop_candidates = [
         os.path.join(DATA_DIR, "raw", "tuik_nufus_yogunluk.xls"),
         os.path.join(DATA_DIR, "raw", "tuik_nufus_yogunluk.xlsx"),
     ]
     pop_path = next((p for p in pop_candidates if os.path.exists(p)), None)
     if pop_path is None:
-        print(f"❌ ERROR: Population .xls file not found in data/raw/")
+        print(f"[ERROR] Population .xls file not found in data/raw/")
         return None
     df_pop = parse_tuik_population_xls(pop_path)
 
-    # Province features (combines electricity + density)
+    # Build province features by combining electricity and density data
     df_features = build_province_features(df_total, df_pop, reference_year=reference_year)
     df_features = add_geographic_regions(df_features)
     df_features.to_csv(os.path.join(PROCESSED_DIR, "province_features.csv"), index=False)
 
-    # [3/3] Eurostat (OPTIONAL)
-    print("\n[3/3] Eurostat renewable share…")
+    # [3/3] Eurostat data (optional)
+    print("\n[3/3] Eurostat renewable share...")
     eurostat_candidates = [
     os.path.join(DATA_DIR, "raw", "eurostat_ren.csv"),
     os.path.join(DATA_DIR, "raw", "nrg_ind_ren_linear_2_0.csv"),
@@ -325,7 +321,7 @@ def prepare_tuik_data(reference_year=2024):
     else:
         print("  Skipped (no Eurostat file)")
 
-    print(f"\n💾 Saved to {PROCESSED_DIR}/")
+    print(f"\nSaved to {PROCESSED_DIR}/")
     print(f"   - province_features.csv         ({df_features.shape})")
     print(f"   - demand_by_province.csv        ({df_total.shape})")
     print("=" * 60)

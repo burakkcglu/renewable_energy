@@ -7,7 +7,7 @@ from pymoo.optimize import minimize
 from pymoo.operators.crossover.sbx import SBX
 from pymoo.operators.mutation.pm import PM
 from pymoo.operators.sampling.rnd import FloatRandomSampling
-
+from pymoo.core.repair import Repair
 # Paths & Params
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROCESSED_DIR = os.path.join(PROJECT_DIR, "data", "processed")
@@ -16,22 +16,43 @@ RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
 
 COST_SOLAR_MW = 0.8
 COST_WIND_MW = 1.2
-BUDGET = 50000.0  # Milyon USD
+BUDGET = 80000.0  # Milyon USD. Calibrated from IRENA 2035 Turkey roadmap
+                  # estimates (60-80B USD for 53GW solar + 30GW wind)
 MIN_REGIONAL_MW = 500.0
 
-# --- SLSQP'de başarıyı getiren Ölçek Normalizasyonu ---
-VAR_SCALE = 1.2e7   # Risk ölçeği
-COST_SCALE = BUDGET # Maliyet ölçeği
+# --- Scale normalization (same as SLSQP) ---
+VAR_SCALE = 8e6    # Re-calibrated for post-CF-fix: risk now ranges 3.9M-8M
+                   # (was 4M-12M with inflated CF). Scaling to max risk
+                   # keeps normalized_risk ∈ [0,1] like normalized_cost.
+COST_SCALE = BUDGET # Cost scale
 
 def normalize_name(text):
     return text.translate(str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosucgiosu")).lower().strip()
 
-# --- VEKTÖRİZE EDİLMİŞ PROBLEM SINIFI (Senin Mimari Önerin) ---
+
+class MinimumThresholdRepair(Repair):
+    """
+    Repair operator for the NSGA-II population.
+    If a province has investment above 0 but below a threshold (e.g. 50 MW),
+    set it to 0 to avoid small unprofitable allocations.
+    """
+    def __init__(self, threshold=50.0):
+        super().__init__()
+        self.threshold = threshold
+
+    def _do(self, problem, X, **kwargs):
+        # Find values between 0 and threshold using logical operators
+        # and set them to 0.0 (repair the gene)
+        mask = np.logical_and(X > 0, X < self.threshold)
+        X[mask] = 0.0
+        return X
+
+# --- VECTORIZED PROBLEM CLASS ---
 class RenewablePortfolioProblem(Problem):
     def __init__(self, cov_matrix, mu_vector, cost_vector, bounds, target_demand, budget, regional_indices):
         n_vars = len(mu_vector)
-        n_obj = 2  # Hedef 1: Risk (Var), Hedef 2: Cost
-        n_constr = 2 + len(regional_indices) # Talep + Bütçe + 7 Bölge
+        n_obj = 2  # Objective 1: Risk, Objective 2: Cost
+        n_constr = 2 + len(regional_indices) # Demand + Budget + 7 Regions
         
         xl = np.array([b[0] for b in bounds])
         xu = np.array([b[1] for b in bounds])
@@ -46,29 +67,29 @@ class RenewablePortfolioProblem(Problem):
         self.regional_indices = regional_indices
 
     def _evaluate(self, X, out, *args, **kwargs):
-        # 1. HEDEFLER (F)
-        # Vektörize Risk Hesabı: (np.einsum ile popülasyondaki tüm bireyler tek seferde hesaplanır)
+        # 1. OBJECTIVES (F)
+        # Vectorized risk calculation (all individuals at once using np.einsum)
         risk = np.einsum('ij,jk,ik->i', X, self.cov_matrix, X)
         cost = X @ self.cost_vector
         
-        # Normalizasyon
+        # Normalization
         f1_risk = risk / VAR_SCALE
         f2_cost = cost / COST_SCALE
         
         out["F"] = np.column_stack([f1_risk, f2_cost])
         
-        # 2. KISITLAR (G) -> Pymoo'da kısıtlar G <= 0 şeklinde olmalıdır
+        # 2. CONSTRAINTS (G) -> In pymoo, constraints must be G <= 0
         G = []
         
-        # Talep Kısıtı: target_demand <= mu * X  =>  target_demand - mu * X <= 0
+        # Demand constraint: target_demand <= mu * X  =>  target_demand - mu * X <= 0
         g_demand = self.target_demand - (X @ self.mu_vector)
         G.append(g_demand)
         
-        # Bütçe Kısıtı: cost <= budget => cost - budget <= 0
+        # Budget constraint: cost <= budget => cost - budget <= 0
         g_budget = cost - self.budget
         G.append(g_budget)
         
-        # Bölgesel Denge Kısıtı: min_regional <= sum(region_x) => min_regional - sum(region_x) <= 0
+        # Regional balance: min_regional <= sum(region_x) => min_regional - sum(region_x) <= 0
         for region, idxs in self.regional_indices.items():
             g_reg = MIN_REGIONAL_MW - np.sum(X[:, idxs], axis=1)
             G.append(g_reg)
@@ -78,7 +99,7 @@ class RenewablePortfolioProblem(Problem):
 def run_nsga2():
     os.makedirs(RESULTS_DIR, exist_ok=True)
     
-    # 1. Veri Yükleme
+    # 1. Load data
     cov_matrix = pd.read_csv(os.path.join(PROCESSED_DIR, "covariance_matrix.csv"), index_col=0).values
     mu_df = pd.read_csv(os.path.join(PROCESSED_DIR, "mean_vector.csv"))
     
@@ -92,15 +113,14 @@ def run_nsga2():
         
     cost_vector = np.array([COST_SOLAR_MW if 'solar' in a else COST_WIND_MW for a in asset_names])
     
-    # 2. Talep ve Sınırlar
+    # 2. Demand and bounds
     df_features = pd.read_csv(os.path.join(PROCESSED_DIR, "province_features.csv"))
     df_features = df_features.drop_duplicates(subset=['province'], keep='last')
     df_features['norm_prov'] = df_features['province'].apply(normalize_name)
     df_features = df_features.set_index('norm_prov')
     
-    total_demand_mwh = df_features['total_demand_mwh'].sum()
-    TARGET_DEMAND = (total_demand_mwh / (365 * 24)) * 0.25 
-    
+    total_demand_mwh = 510.5 * 1e6  # TWh to MWh
+    TARGET_DEMAND = (total_demand_mwh / (365 * 24)) * 0.25
     bounds_df = pd.read_csv(os.path.join(PROCESSED_DIR, "capacity_bounds.csv"), index_col=0)
     bounds = []
     for asset in asset_names:
@@ -109,7 +129,7 @@ def run_nsga2():
         except KeyError:
             bounds.append((0, 500.0))
     
-    # 3. Bölgesel İndeksler (Features üzerinden)
+    # 3. Regional indices (from features)
     regional_indices = {}
     for i, asset in enumerate(asset_names):
         prov_name = normalize_name(asset.split('_')[0])
@@ -124,7 +144,7 @@ def run_nsga2():
             regional_indices[region] = []
         regional_indices[region].append(i)
 
-    # 4. Optimizasyon (Problem + Algoritma Tanımı)
+    # 4. Optimization (Problem + Algorithm setup)
     problem = RenewablePortfolioProblem(
         cov_matrix=cov_matrix, 
         mu_vector=mu_vector, 
@@ -135,17 +155,18 @@ def run_nsga2():
         regional_indices=regional_indices
     )
     
-    # Proposal ile tutarlı: Pop=200
+    # Consistent with proposal: Pop=200
     algorithm = NSGA2(
         pop_size=200,                
         sampling=FloatRandomSampling(),
         crossover=SBX(prob=0.9, eta=15),
         mutation=PM(eta=20),
+        repair=MinimumThresholdRepair(threshold=50.0),
         eliminate_duplicates=True
     )
     
-    print(f"NSGA-II Optimizasyonu Başlıyor... (Popülasyon: 200, Jenerasyon: 500)")
-    # Proposal ile tutarlı: Gen=500
+    print(f"NSGA-II Optimization Starting... (Population: 200, Generations: 500)")
+    # Consistent with proposal: Gen=500
     res = minimize(
         problem,
         algorithm,
@@ -155,10 +176,10 @@ def run_nsga2():
         verbose=True                 
     )
     
-    # 5. Pareto Cephesinin Çıkarılması (Feasibility Filter)
+    # 5. Extract the Pareto Front (feasibility filter)
     if res.X is not None:
         results = []
-        # res.X sadece geçerli (kısıtları sağlayan) bireyleri içerir
+        # res.X contains only feasible individuals (those that satisfy constraints)
         for i, x in enumerate(res.X):
             actual_risk = np.dot(x.T, np.dot(cov_matrix, x))
             actual_cost = np.dot(cost_vector, x)
@@ -170,15 +191,15 @@ def run_nsga2():
         cols = ['total_cost', 'total_risk', 'expected_production'] + list(asset_names)
         df_out = pd.DataFrame(results, columns=cols)
         
-        # Risk bazında sıralıyoruz ki grafikte Pareto çizgisi düzgün çizilebilsin
+        # Sort by risk so the Pareto line looks right on the graph
         df_out = df_out.sort_values(by='total_risk').reset_index(drop=True)
         
         out_path = os.path.join(RESULTS_DIR, "pareto_front_nsga2.csv")
         df_out.to_csv(out_path, index=False)
-        print(f"\n✓ NSGA-II Tamamlandı! Pareto cephesinde {len(df_out)} geçerli çözüm bulundu.")
-        print(f"Çıktı kaydedildi: {out_path}")
+        print(f"\n[OK] NSGA-II Done! Found {len(df_out)} feasible solutions on the Pareto front.")
+        print(f"Output saved: {out_path}")
     else:
-        print("\nKritik Uyarı: NSGA-II geçerli (feasible) bir çözüm bulamadı.")
+        print("\n[WARNING] NSGA-II could not find any feasible solution.")
 
 if __name__ == "__main__":
     run_nsga2()

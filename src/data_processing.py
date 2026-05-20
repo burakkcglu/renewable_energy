@@ -19,57 +19,59 @@ PROCESSED_DIR = os.path.join(PROJECT_DIR, "data", "processed")
 
 # --- Solar capacity factor ---
 
-def solar_capacity_factor(ghi, temp, panel_efficiency=0.18,
+def solar_capacity_factor(ghi, temp, performance_ratio=0.80,
                           temp_coeff=-0.004, t_ref=25.0):
     """
-    Convert Global Horizontal Irradiance to solar capacity factor.
-    
-    Parameters
-    ----------
-    ghi : float or array
-        Solar radiation in kWh/m2/day
-    temp : float or array
-        Ambient temperature in Celsius
-    panel_efficiency : float
-        Panel efficiency at standard test conditions (default 18%)
-    temp_coeff : float
-        Power temperature coefficient (%/C, typical -0.4%)
-    t_ref : float
-        Reference temperature for STC (25 C)
-    
+    Convert Global Horizontal Irradiance to solar PV capacity factor.
+
+    Methodology:
+    ------------
+    Capacity factor (CF) is the ratio of actual annual energy production
+    to the theoretical maximum if the plant ran at rated power 24/7:
+
+        CF = E_actual / (P_rated × 8760)
+
+    For a PV system, instantaneous power output ≈ (GHI / G_STC) × P_rated,
+    where G_STC = 1 kW/m² is the standard test condition irradiance under
+    which rated capacity is defined.
+
+    Daily average:
+        CF_daily = (GHI_kWh_per_day × PR) / (24 × G_STC)
+                 = (GHI × PR) / 24
+
+    Where PR (Performance Ratio) captures real-world losses NOT already
+    embedded in the rated capacity:
+      - Inverter losses        (~3-5%)
+      - DC cable & mismatch    (~2-3%)
+      - Soiling & shading      (~5-10%)
+      - Availability           (~1-2%)
+    Typical PR = 0.75-0.85 (IEA-PVPS Task 13). We use 0.80.
+
+    Note: We do NOT multiply by panel efficiency η, because rated capacity
+    (in MW) is already defined AT panel efficiency under STC. Including η
+    here would double-count it — a common implementation bug that inflates
+    CF values by 1/η ≈ 5-6×.
+
+    Temperature correction:
+        Output derates linearly above 25°C at typical -0.4%/°C.
+        Above ambient ≈ 25°C, panel surface is ~25-30°C warmer.
+
     Returns
     -------
-    float or array
-        Capacity factor between 0 and 1
+    cf : float or array, in [0, 1]
+        Daily mean capacity factor.
     """
-    # Solar capacity factor methodology:
-    #
-    # GHI (Global Horizontal Irradiance) is energy in kWh/m²/day.
-    # Theoretical maximum is roughly 10 kWh/m²/day (very high-irradiance
-    # locations achieve 7-8 in summer; we use 10 as a normalization ceiling).
-    #
-    # Note: We do NOT multiply by η here, because rated panel capacity (MW)
-    # is already defined at η efficiency (datasheet at STC). Multiplying
-    # would double-count the efficiency factor — this is the η-double-counting
-    # bug that some implementations make.
-    #
-    # CF = (GHI / GHI_max) × temperature_correction
-    # where temperature_correction handles the -0.4%/°C derating above 25°C.
+    # Temperature correction (panels lose power as they heat up)
+    temp_correction = 1.0 + temp_coeff * (temp - t_ref)
+    temp_correction = np.clip(temp_correction, 0.7, 1.05)
 
-    # Temperature correction
-    temp_correction = 1 + temp_coeff * (temp - t_ref)
-    temp_correction = np.clip(temp_correction, 0.5, 1.2)
-
-    # Capacity factor: GHI normalized by peak possible
-    # Peak daily irradiance roughly 7-8 kWh/m2/day for best locations
-    # We normalize by theoretical max (about 10 kWh/m2/day)
-    cf = (ghi / 10.0) * temp_correction
+    # Daily capacity factor (correct dimensional analysis)
+    cf = (ghi * performance_ratio) / 24.0 * temp_correction
 
     # Clip to valid range
     cf = np.clip(cf, 0.0, 1.0)
 
     return cf
-
 
 # --- Wind capacity factor ---
 
@@ -95,15 +97,15 @@ def wind_capacity_factor(wind_speed_10m, wind_speed_50m, cut_in=3.0, rated=12.0,
     This makes our wind CFs physically more faithful to each province's
     actual terrain and atmospheric profile.
     """
-    # Sıfıra bölme hatasını engellemek için çok küçük rüzgarları 0.1 m/s yapıyoruz
+    # Set very small wind speeds to 0.1 to avoid dividing by zero
     ws_10 = np.maximum(wind_speed_10m, 0.1)
     ws_50 = np.maximum(wind_speed_50m, 0.1)
     
-    # Dinamik Wind Shear Exponent (Alpha) hesabı
+    # Calculate the wind shear exponent (alpha) for each data point
     alpha = np.log(ws_50 / ws_10) / np.log(50.0 / 10.0)
     alpha = np.clip(alpha, 0.1, 0.4) 
     
-    # Hızı 50 metreden türbin göbek yüksekliğine (80m) çıkart
+    # Scale the 50m wind speed up to turbine hub height (80m)
     ws_hub = ws_50 * ((hub_height / 50.0) ** alpha)
 
     # Simplified power curve
@@ -217,7 +219,7 @@ def process_all_data():
     daily_cf_path = os.path.join(PROCESSED_DIR, "daily_cf_matrix.csv")
     # Re-build daily wide format quickly (avoid recomputation)
     daily_wide_path = daily_cf_path  # placeholder
-    # Sadece monthly tutuyoruz, daily zaten daily_with_cf.csv'de var (long format)
+    # We only keep monthly data; daily is already in daily_with_cf.csv (long format)
 
     # Save covariance matrix
     cov_df = pd.DataFrame(cov_matrix,
@@ -257,7 +259,7 @@ def process_all_data():
     print("Computing density-based capacity upper bounds...")
     pf_path = os.path.join(PROCESSED_DIR, "province_features.csv")
     if not os.path.exists(pf_path):
-        print(f"  ⚠ Warning: {pf_path} not found. Skipping bounds generation.")
+        print(f"  [WARNING] {pf_path} not found. Skipping bounds generation.")
     else:
         pf = pd.read_csv(pf_path)
 
@@ -275,7 +277,7 @@ def process_all_data():
             row = pf[pf['province'] == province]
             if len(row) == 0:
                 # Fallback if province name mismatch
-                print(f"  ⚠ No features for {province}, using medium class default")
+                print(f"  [WARNING] No features for {province}, using medium class default")
                 cls = 'medium'
             else:
                 cls = row.iloc[0]['intensity_class']
@@ -353,9 +355,9 @@ def compute_covariance_matrix(df, frequency='monthly'):
     eigenvalues = np.linalg.eigvalsh(cov_matrix)
     min_eig = eigenvalues.min()
     if min_eig < -1e-8:
-        print(f"  ⚠ Warning: covariance matrix has negative eigenvalue {min_eig:.2e}")
+        print(f"  [WARNING] Covariance matrix has negative eigenvalue {min_eig:.2e}")
     else:
-        print(f"  ✓ Covariance matrix is PSD (min eigenvalue: {min_eig:.2e})")
+        print(f"  [OK] Covariance matrix is PSD (min eigenvalue: {min_eig:.2e})")
 
     return cov_matrix, mu_vector, asset_names, wide_agg
 

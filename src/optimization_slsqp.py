@@ -11,15 +11,18 @@ RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
 
 COST_SOLAR_MW = 0.8
 COST_WIND_MW = 1.2
-BUDGET = 50000.0  # Milyon USD
+BUDGET = 80000.0  # Milyon USD. Calibrated from IRENA 2035 Turkey roadmap
+                  # estimates (60-80B USD for 53GW solar + 30GW wind).
 MIN_REGIONAL_MW = 500.0
 
-# Ölçek Normalizasyonu
+# Scale normalization
 # Calibrated empirically from observed solution magnitudes:
 #   - pure-cost solution: cost ≈ 17000, risk ≈ 1.2e7
 #   - pure-risk solution: cost ≈ 50000, risk ≈ 4-6e6
 # Scaling both objectives to roughly [0,1] makes λ interpretable.
-VAR_SCALE = 1.2e7
+VAR_SCALE = 8e6    # Re-calibrated for post-CF-fix: risk now ranges 3.9M-8M
+                   # (was 4M-12M with inflated CF). Scaling to max risk
+                   # keeps normalized_risk ∈ [0,1] like normalized_cost.
 COST_SCALE = BUDGET  # = 50000
 
 
@@ -65,18 +68,22 @@ def run_slsqp():
     cov_matrix, mu_vector, asset_names = load_optimization_data()
     n_vars = len(asset_names)
 
-    # --- TÜİK Verisi ---
+    # --- TUIK Data ---
     df_features = pd.read_csv(os.path.join(PROCESSED_DIR, "province_features.csv"))
     df_features = df_features.drop_duplicates(subset=['province'], keep='last')
     df_features['norm_prov'] = df_features['province'].apply(normalize_name)
     df_features = df_features.set_index('norm_prov')
 
-    total_demand_mwh = df_features['total_demand_mwh'].sum()
+    # 2035 National Energy Plan update
+    # Instead of the old TUIK demand (total_demand_mwh = df_features['total_demand_mwh'].sum()),
+    # we use the 2035 projection of 510.5 TWh for forward-looking stress testing.
+    total_demand_mwh = 510.5 * 1e6  # TWh to MWh
     TARGET_DEMAND = (total_demand_mwh / (365 * 24)) * 0.25
+    
 
     cost_vector = create_cost_vector(asset_names)
 
-    # --- Hazır Bounds Verisi ---
+    # --- Load pre-computed bounds ---
     bounds_df = pd.read_csv(
         os.path.join(PROCESSED_DIR, "capacity_bounds.csv"), index_col=0
     )
@@ -95,7 +102,7 @@ def run_slsqp():
     x0_max = np.array(x0_max)
 
     # --- Regional Balance Constraint ---
-    # Bölge bilgisini doğrudan province_features içinden çekiyoruz.
+    # Get region info from province_features.
     regional_indices = {}
     for i, asset in enumerate(asset_names):
         prov_name = normalize_name(asset.split('_')[0])
@@ -110,7 +117,7 @@ def run_slsqp():
             regional_indices[region] = []
         regional_indices[region].append(i)
 
-    # Kısıtlar
+    # Constraints
     cons = [
         {'type': 'ineq', 'fun': lambda x: np.dot(mu_vector, x) - TARGET_DEMAND},
         {'type': 'ineq', 'fun': lambda x: BUDGET - np.dot(cost_vector, x)},
@@ -189,7 +196,7 @@ def run_slsqp():
     # ---------- Pareto Post-Processing ----------
     # The multi-start optimizer can land on different local optima for
     # different λ. The TRUE efficient frontier should be monotonic:
-    # higher λ → lower risk, higher cost. We filter out dominated points
+    # higher lambda means lower risk, higher cost. We filter out dominated points
     # (any point that's both more expensive AND riskier than another).
     cols = ['lambda', 'total_cost', 'total_risk', 'expected_production'] + list(asset_names)
     df_raw = pd.DataFrame(results, columns=cols)
