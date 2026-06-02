@@ -1,0 +1,31 @@
+================================================================
+STRATEGIC ANALYSIS & REPORT NOTES (hybrid)
+================================================================
+
+1. PORTFOLIO SUMMARY (representative solution per method)
+   Target 127.6 TWh/yr | budget $80B
+   SLSQP   : solar   67.0 GW | wind   32.7 GW | cost $ 63.0B | prod  127.6 TWh | solar share   67%
+   NSGA-II : solar   63.7 GW | wind   33.4 GW | cost $ 61.7B | prod  127.6 TWh | solar share   66%
+   SA      : solar   66.7 GW | wind   29.6 GW | cost $ 60.4B | prod  127.6 TWh | solar share   69%
+
+2. ROBUSTNESS
+   SLSQP   : MC mean  127.5 TWh (P5 121.9) | chance P(<D_min)  0.0% PASS | drought 57.5% | avoided $7.6B/yr (+50%: $11.5B)
+   NSGA2   : MC mean  127.5 TWh (P5 121.6) | chance P(<D_min)  0.0% PASS | drought 58.6% | avoided $7.6B/yr (+50%: $11.5B)
+   SA      : MC mean  127.4 TWh (P5 122.0) | chance P(<D_min)  0.0% PASS | drought 56.8% | avoided $7.6B/yr (+50%: $11.5B)
+
+3. DIVERSIFICATION (naive vs optimized, same budget)
+   solar_only  : mean  157.9 TWh | coverage 123.7% | std 5.52
+   wind_only   : mean   66.7 TWh | coverage  52.3% | std 2.33
+   equal_split : mean  112.3 TWh | coverage  88.0% | std 2.30
+   optimized   : mean  127.6 TWh | coverage 100.0% | std 2.63
+
+4. EU BENCHMARK (2024, Eurostat (overall RES share))
+   Overall RES share (% of gross final energy): EU 25.2% | Germany 22.5% | Spain 25.4% | Italy 19.4%
+   NOTE: this Eurostat figure is share of TOTAL final energy (heat+transport+electricity). Our 25% target is of national ELECTRICITY demand from NEW solar+wind only, so the two are different bases and not directly comparable — use the EU numbers as directional context for where Turkey sits, not a like-for-like target.
+
+5. REPORT-DEFENSE NOTES (proposal -> what we actually did)
+   * Solar CF: dropped the eta multiplier from the proposal formula. Rated MW already embeds eta at STC; including it double-counts and shrinks CF ~5.6x. Result: realistic solar CF.
+   * Wind CF: replaced fixed 1/7 shear with a dynamic per-datapoint exponent from WS10M+WS50M, kept a physical cubic power curve.
+   * Chance constraint (Eq.6): post-hoc verification (P(annual<D_min)<=5%) rather than an in-loop constraint.
+   * NSGA-II justified by the 0-or->=50 MW rule (MinimumThresholdRepair).
+   * Single config.py: one BUDGET everywhere (fixes the earlier 80k-vs-50k inconsistency).

@@ -1,227 +1,107 @@
+"""
+optimization_slsqp.py
+=====================
+Markowitz mean-variance via SLSQP, sweeping lambda to trace the efficient
+frontier.
+
+HYBRID: independent multi-start per lambda (notebook's insight — chaining warm
+starts collapses the frontier to one local optimum) PLUS the src Pareto-dominance
+post-filter (keeps the frontier monotonic). Gradient supplied analytically.
+"""
+
 import os
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 from tqdm import tqdm
 
-# Paths & Params
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROCESSED_DIR = os.path.join(PROJECT_DIR, "data", "processed")
-RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
-
-COST_SOLAR_MW = 0.8
-COST_WIND_MW = 1.2
-BUDGET = 80000.0  # Milyon USD. Calibrated from IRENA 2035 Turkey roadmap
-                  # estimates (60-80B USD for 53GW solar + 30GW wind).
-MIN_REGIONAL_MW = 500.0
-
-# Scale normalization
-# Calibrated empirically from observed solution magnitudes:
-#   - pure-cost solution: cost ≈ 17000, risk ≈ 1.2e7
-#   - pure-risk solution: cost ≈ 50000, risk ≈ 4-6e6
-# Scaling both objectives to roughly [0,1] makes λ interpretable.
-VAR_SCALE = 8e6    # Re-calibrated for post-CF-fix: risk now ranges 3.9M-8M
-                   # (was 4M-12M with inflated CF). Scaling to max risk
-                   # keeps normalized_risk ∈ [0,1] like normalized_cost.
-COST_SCALE = BUDGET  # = 50000
-
-
-def normalize_name(text):
-    return text.translate(str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosucgiosu")).lower().strip()
-
-
-def load_optimization_data():
-    cov_matrix = pd.read_csv(
-        os.path.join(PROCESSED_DIR, "covariance_matrix.csv"), index_col=0
-    ).values
-    mu_df = pd.read_csv(os.path.join(PROCESSED_DIR, "mean_vector.csv"))
-
-    if 'asset' in mu_df.columns:
-        asset_names = mu_df['asset'].values
-        mean_col = [c for c in mu_df.columns if c != 'asset'][0]
-        mu_vector = mu_df[mean_col].values
-    else:
-        asset_names = mu_df.iloc[:, 0].values
-        mu_vector = mu_df.iloc[:, 1].values
-
-    return cov_matrix, mu_vector, list(asset_names)
-
-
-def create_cost_vector(asset_names):
-    return np.array(
-        [COST_SOLAR_MW if 'solar' in asset else COST_WIND_MW for asset in asset_names]
-    )
-
-
-def objective_function(x, lambda_val, cov_matrix, cost_vector):
-    risk = np.dot(x.T, np.dot(cov_matrix, x))
-    cost = np.dot(cost_vector, x)
-
-    normalized_risk = risk / VAR_SCALE
-    normalized_cost = cost / COST_SCALE
-
-    return lambda_val * normalized_risk + (1 - lambda_val) * normalized_cost
+import config as C
+import opt_common as OC
 
 
 def run_slsqp():
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    cov_matrix, mu_vector, asset_names = load_optimization_data()
-    n_vars = len(asset_names)
+    os.makedirs(C.RESULTS_DIR, exist_ok=True)
+    P = OC.load_problem()
+    cf_by_month, demand_by_month = OC.load_monthly_profiles()
+    use_monthly = cf_by_month is not None
+    if use_monthly:
+        print(f"  Monthly demand matching ON: {len(demand_by_month)} months")
+    else:
+        print("  Monthly profiles not found — annual-only mode.")
+    cov, mu, cvec = P["cov"], P["mu_mwh"], P["cost_vec"]
+    upper, D_target = P["upper"], P["D_target"]
+    var_scale = P["var_scale"]
+    n = P["n"]
 
-    # --- TUIK Data ---
-    df_features = pd.read_csv(os.path.join(PROCESSED_DIR, "province_features.csv"))
-    df_features = df_features.drop_duplicates(subset=['province'], keep='last')
-    df_features['norm_prov'] = df_features['province'].apply(normalize_name)
-    df_features = df_features.set_index('norm_prov')
+    def obj(x, lam):
+        return lam * (x @ cov @ x) / var_scale + (1 - lam) * (cvec @ x) / C.COST_SCALE
 
-    # 2035 National Energy Plan update
-    # Instead of the old TUIK demand (total_demand_mwh = df_features['total_demand_mwh'].sum()),
-    # we use the 2035 projection of 510.5 TWh for forward-looking stress testing.
-    total_demand_mwh = 510.5 * 1e6  # TWh to MWh
-    TARGET_DEMAND = (total_demand_mwh / (365 * 24)) * 0.25
-    
+    def grad(x, lam):
+        return lam * (2 * cov @ x) / var_scale + (1 - lam) * cvec / C.COST_SCALE
 
-    cost_vector = create_cost_vector(asset_names)
-
-    # --- Load pre-computed bounds ---
-    bounds_df = pd.read_csv(
-        os.path.join(PROCESSED_DIR, "capacity_bounds.csv"), index_col=0
-    )
-    bounds = []
-    x0_max = []
-    for asset in asset_names:
-        try:
-            upper_limit = bounds_df.loc[asset, 'upper_mw']
-        except KeyError:
-            upper_limit = 500.0 if 'solar' in asset else 300.0
-
-        bounds.append((0, upper_limit))
-        x0_max.append(upper_limit)
-
-    bounds = tuple(bounds)
-    x0_max = np.array(x0_max)
-
-    # --- Regional Balance Constraint ---
-    # Get region info from province_features.
-    regional_indices = {}
-    for i, asset in enumerate(asset_names):
-        prov_name = normalize_name(asset.split('_')[0])
-        try:
-            region = df_features.loc[prov_name, 'region']
-            if isinstance(region, pd.Series):
-                region = region.iloc[0]
-        except KeyError:
-            region = 'Unknown'
-
-        if region not in regional_indices:
-            regional_indices[region] = []
-        regional_indices[region].append(i)
-
-    # Constraints
+    bounds = tuple((0.0, u) for u in upper)
     cons = [
-        {'type': 'ineq', 'fun': lambda x: np.dot(mu_vector, x) - TARGET_DEMAND},
-        {'type': 'ineq', 'fun': lambda x: BUDGET - np.dot(cost_vector, x)},
+        {"type": "ineq", "fun": lambda x: mu @ x - D_target, "jac": lambda x: mu},
+        {"type": "ineq", "fun": lambda x: C.BUDGET_USD - cvec @ x, "jac": lambda x: -cvec},
     ]
+    for region, idxs in P["regional_indices"].items():
+        cons.append({"type": "ineq",
+                     "fun": lambda x, i=idxs: np.sum(x[i]) - C.MIN_REGIONAL_MW})
+    # Step 2: monthly demand matching.
+    # For each calendar month m: (CF_m · x) * hours_in_month >= demand_m
+    # CF_m·x is average MW that month; multiply by month hours to get MWh.
+    if use_monthly:
+        hours_per_month = C.HOURS_PER_YEAR / 12.0
+        for m in range(12):
+            cf_m = cf_by_month[m]
+            d_m = demand_by_month[m] * C.MONTHLY_COVERAGE   # %90 kapsama
+            cons.append({
+                "type": "ineq",
+                "fun": lambda x, c=cf_m, d=d_m: (c @ x) * hours_per_month - d,
+                "jac": lambda x, c=cf_m: c * hours_per_month,
+            })
 
-    for region, indices in regional_indices.items():
-        cons.append({
-            'type': 'ineq',
-            'fun': lambda x, idxs=indices: np.sum(x[idxs]) - MIN_REGIONAL_MW,
-        })
+    # Two diverse, INDEPENDENT starting points (not chained across lambda)
+    half = upper / 2.0
+    x0_solar = np.where(np.arange(n) < n // 2, half, half * 0.1)
+    x0_wind = np.where(np.arange(n) < n // 2, half * 0.1, half)
 
-    # --- Multi-Start Initial Conditions ---
-    x0_zero = np.zeros(n_vars)
-    results = []
+    maxit = 1000
     lambdas = np.linspace(0.01, 0.99, 20)
+    results = []
+    print(f"SLSQP frontier: {len(lambdas)} lambdas x 2 independent starts | "
+          f"D_target={D_target/1e6:.1f} TWh/yr")
 
-    print(f"Tracing Efficient Frontier with Dynamic Demand: {TARGET_DEMAND:.2f} MW...")
+    for lam in tqdm(lambdas, desc="SLSQP"):
+        best = None
+        for x0 in (x0_solar, x0_wind):
+            res = minimize(obj, x0, args=(lam,), jac=grad, method="SLSQP",
+                           bounds=bounds, constraints=cons,
+                           options={"maxiter": maxit, "ftol": 1e-9})
+            if (res.success or res.status in (1, 8)):
+                if best is None or res.fun < best.fun:
+                    best = res
+        if best is not None:
+            x = best.x
+            results.append([round(lam, 3), OC.cost(x, cvec), OC.variance(x, cov),
+                            OC.production(x, mu)] + list(x))
 
-    np.random.seed(42)  # reproducibility
-    for l in tqdm(lambdas, desc="Optimizing SLSQP"):
-        candidates = []
+    cols = ["lambda", "total_cost", "total_risk", "expected_production"] + P["asset_names"]
+    df = pd.DataFrame(results, columns=cols).sort_values("total_cost").reset_index(drop=True)
 
-        # Start 1: zeros (favors small-capacity solutions)
-        res = minimize(
-            objective_function, x0_zero, args=(l, cov_matrix, cost_vector),
-            method='SLSQP', bounds=bounds, constraints=cons,
-            options={'maxiter': 1000, 'ftol': 1e-7},
-        )
-        if res.success:
-            candidates.append(res)
+    # Pareto dominance filter (src): keep points where risk strictly decreases as cost rises
+    keep = [0]
+    min_risk = df.loc[0, "total_risk"]
+    for i in range(1, len(df)):
+        if df.loc[i, "total_risk"] < min_risk:
+            keep.append(i); min_risk = df.loc[i, "total_risk"]
+    df_out = df.loc[keep].reset_index(drop=True)
 
-        # Start 2: max bounds (favors large-capacity solutions)
-        res = minimize(
-            objective_function, x0_max, args=(l, cov_matrix, cost_vector),
-            method='SLSQP', bounds=bounds, constraints=cons,
-            options={'maxiter': 1000, 'ftol': 1e-7},
-        )
-        if res.success:
-            candidates.append(res)
-
-        # Start 3: balanced — proportional to mu (favors productive assets)
-        x0_mu = (BUDGET / np.dot(cost_vector, mu_vector / mu_vector.max())) * (
-            mu_vector / mu_vector.max()
-        )
-        x0_mu = np.clip(x0_mu, 0, x0_max)
-        res = minimize(
-            objective_function, x0_mu, args=(l, cov_matrix, cost_vector),
-            method='SLSQP', bounds=bounds, constraints=cons,
-            options={'maxiter': 1000, 'ftol': 1e-7},
-        )
-        if res.success:
-            candidates.append(res)
-
-        # Start 4: random within bounds (escape pathological local minima)
-        x0_rand = np.random.uniform(0, x0_max * 0.5)
-        res = minimize(
-            objective_function, x0_rand, args=(l, cov_matrix, cost_vector),
-            method='SLSQP', bounds=bounds, constraints=cons,
-            options={'maxiter': 1000, 'ftol': 1e-7},
-        )
-        if res.success:
-            candidates.append(res)
-
-        # Pick the best among successful candidates
-        best_res = min(candidates, key=lambda r: r.fun) if candidates else None
-
-        if best_res:
-            p_risk = np.dot(best_res.x.T, np.dot(cov_matrix, best_res.x))
-            p_cost = np.dot(cost_vector, best_res.x)
-            p_prod = np.dot(mu_vector, best_res.x)
-            row = [round(l, 3), p_cost, p_risk, p_prod] + list(best_res.x)
-            results.append(row)
-        else:
-            print(f"Warning: No feasible solution found for lambda={l:.2f}")
-
-    # ---------- Pareto Post-Processing ----------
-    # The multi-start optimizer can land on different local optima for
-    # different λ. The TRUE efficient frontier should be monotonic:
-    # higher lambda means lower risk, higher cost. We filter out dominated points
-    # (any point that's both more expensive AND riskier than another).
-    cols = ['lambda', 'total_cost', 'total_risk', 'expected_production'] + list(asset_names)
-    df_raw = pd.DataFrame(results, columns=cols)
-
-    # Sort by cost ascending
-    df_sorted = df_raw.sort_values('total_cost').reset_index(drop=True)
-
-    # Keep only points where risk strictly decreases as cost increases
-    keep_idx = [0]  # always keep the cheapest point
-    min_risk_so_far = df_sorted.loc[0, 'total_risk']
-    for i in range(1, len(df_sorted)):
-        if df_sorted.loc[i, 'total_risk'] < min_risk_so_far:
-            keep_idx.append(i)
-            min_risk_so_far = df_sorted.loc[i, 'total_risk']
-
-    df_out = df_sorted.loc[keep_idx].reset_index(drop=True)
-    n_dropped = len(df_raw) - len(df_out)
-    if n_dropped > 0:
-        print(f"Dropped {n_dropped} dominated points "
-              f"(kept {len(df_out)} on Pareto frontier).")
-
-    out_path = os.path.join(RESULTS_DIR, "efficient_frontier_slsqp.csv")
-    df_out.to_csv(out_path, index=False)
-    print(f"\nSLSQP Complete! Pareto frontier has {len(df_out)} points. "
-          f"Saved to {out_path}")
+    path = os.path.join(C.RESULTS_DIR, "efficient_frontier_slsqp.csv")
+    df_out.to_csv(path, index=False)
+    print(f"SLSQP done: {len(df_out)} Pareto points (dropped {len(df)-len(df_out)}). "
+          f"Saved {path}")
+    return df_out
 
 
 if __name__ == "__main__":
